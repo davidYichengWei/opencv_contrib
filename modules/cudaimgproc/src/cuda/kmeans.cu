@@ -19,6 +19,11 @@ inline void __opencv_cuda_check(cudaError_t err, const char *file, const int lin
     }
 }
 
+// Forward declarations
+extern "C" {
+    void printTimingStats();
+}
+
 namespace {
 
 // Define distance constants for device code
@@ -65,27 +70,6 @@ __global__ void assignCentersKernel(
 
     labels(idx, 0) = minLabel;
     distances(idx, 0) = minDist;
-}
-
-// Kernel for updating centers
-template<typename T>
-__global__ void updateCentersSumKernel(
-    const PtrStepSz<T> data,
-    const PtrStepSz<int> labels,
-    PtrStepSz<T> centers,
-    int* center_counts,
-    const int K
-) {
-    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= data.rows) return;
-
-    const int label = labels(idx, 0);
-    if (label >= 0 && label < K) {
-        for (int dim = 0; dim < data.cols; dim++) {
-            atomicAdd(&centers(label, dim), data(idx, dim));
-        }
-        atomicAdd(&center_counts[label], 1);
-    }
 }
 
 // Kernel for computing center means
@@ -267,6 +251,126 @@ __global__ void selectNextCenterKernel(
     }
 }
 
+template<typename T>
+__global__ void updateCentersSumCoalescedKernel(
+    const PtrStepSz<T> data,        // Input data points [N][D]
+    const PtrStepSz<int> labels,    // Labels for each point [N][1]
+    PtrStepSz<T> centers,           // Center coordinates [K][D]
+    int* center_counts,             // Points per center [K]
+    const int K                     // Number of clusters
+) {
+    // Shared memory layout optimization:
+    // Instead of doing atomic operations directly on global memory,
+    // we first accumulate in shared memory which is much faster
+    extern __shared__ float shared_mem[];
+    // [K][BLOCK_DIMS] layout for better memory coalescing
+    float* shared_centers = shared_mem;  
+    // Place counts after centers data to maximize shared memory usage
+    int* shared_counts = (int*)(shared_centers + K * blockDim.y);
+    
+    // Initialize shared memory to zeros
+    // Each thread handles multiple centers if K > blockDim.x
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        // Each thread in y-dimension handles one dimension
+        for (int d = threadIdx.y; d < blockDim.y; d += blockDim.y) {
+            shared_centers[k * blockDim.y + d] = 0.0f;
+        }
+        // Only first row of threads initializes counts
+        if (threadIdx.y == 0) {
+            shared_counts[k] = 0;
+        }
+    }
+    __syncthreads();  // Ensure initialization is complete
+
+    // 2D Thread Block Optimization:
+    // x-dimension: handles different points (blockDim.x = 256)
+    // y-dimension: handles different dimensions (blockDim.y = 16)
+    const int points_per_block = blockDim.x;
+    const int point_idx = blockIdx.x * points_per_block + threadIdx.x;
+    const int dim_idx = threadIdx.y;
+    
+    // Memory Coalescing Optimization:
+    // Threads in the same warp access consecutive memory locations
+    // This maximizes memory bandwidth utilization
+    if (point_idx < data.rows && dim_idx < data.cols) {
+        const int label = labels(point_idx, 0);
+        if (label >= 0 && label < K) {
+            // Atomic Add Optimization:
+            // 1. Use shared memory atomics instead of global memory
+            // 2. Memory access pattern is more cache-friendly
+            // 3. Much less contention than global atomics
+            atomicAdd(&shared_centers[label * blockDim.y + dim_idx], 
+                     data(point_idx, dim_idx));
+            
+            // Count updates only needed once per point
+            if (dim_idx == 0) {
+                atomicAdd(&shared_counts[label], 1);
+            }
+        }
+    }
+    __syncthreads();  // Ensure all updates to shared memory are complete
+
+    // Final Global Memory Update Optimization:
+    // 1. Reduced number of global atomic operations
+    // 2. Each block only needs one atomic update per center-dimension pair
+    // 3. Better memory coalescing as threads update consecutive dimensions
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        if (dim_idx < data.cols) {
+            atomicAdd(&centers(k, dim_idx), 
+                     shared_centers[k * blockDim.y + dim_idx]);
+        }
+        // Only first row of threads updates counts
+        if (threadIdx.y == 0) {
+            atomicAdd(&center_counts[k], shared_counts[k]);
+        }
+    }
+}
+
+struct TimingStats {
+    float kmeans_init_pp = 0;
+    float kmeans_assign_labels = 0;
+    float kmeans_update_centers = 0;
+    float kmeans_center_shift = 0;
+    float kmeans_compute_compactness = 0;
+    int init_pp_calls = 0;
+    int assign_labels_calls = 0;
+    int update_centers_calls = 0;
+    int center_shift_calls = 0;
+    int compute_compactness_calls = 0;
+};
+
+static TimingStats timing_stats;
+
+extern "C" void printTimingStats() {
+    printf("\nKMeans CUDA Timing Summary:\n");
+    printf("kmeans_init_pp_cuda:           %.2f ms (avg %.2f ms over %d calls)\n", 
+           timing_stats.kmeans_init_pp,
+           timing_stats.kmeans_init_pp / timing_stats.init_pp_calls,
+           timing_stats.init_pp_calls);
+    printf("kmeans_assign_labels_cuda:     %.2f ms (avg %.2f ms over %d calls)\n", 
+           timing_stats.kmeans_assign_labels,
+           timing_stats.kmeans_assign_labels / timing_stats.assign_labels_calls,
+           timing_stats.assign_labels_calls);
+    printf("kmeans_update_centers_cuda:    %.2f ms (avg %.2f ms over %d calls)\n", 
+           timing_stats.kmeans_update_centers,
+           timing_stats.kmeans_update_centers / timing_stats.update_centers_calls,
+           timing_stats.update_centers_calls);
+    printf("kmeans_center_shift_cuda:      %.2f ms (avg %.2f ms over %d calls)\n", 
+           timing_stats.kmeans_center_shift,
+           timing_stats.kmeans_center_shift / timing_stats.center_shift_calls,
+           timing_stats.center_shift_calls);
+    printf("kmeans_compute_compactness_cuda: %.2f ms (avg %.2f ms over %d calls)\n", 
+           timing_stats.kmeans_compute_compactness,
+           timing_stats.kmeans_compute_compactness / timing_stats.compute_compactness_calls,
+           timing_stats.compute_compactness_calls);
+    printf("Total CUDA kernel time: %.2f ms\n\n",
+           timing_stats.kmeans_init_pp + 
+           timing_stats.kmeans_assign_labels +
+           timing_stats.kmeans_update_centers + 
+           timing_stats.kmeans_center_shift +
+           timing_stats.kmeans_compute_compactness);
+}
+
 } // namespace
 
 // Implementation of CUDA interface functions
@@ -369,7 +473,8 @@ void kmeans_assign_labels_cuda(const GpuMat& data, const GpuMat& centers,
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("kmeans_assign_labels_cuda took %f ms\n", milliseconds);
+    timing_stats.kmeans_assign_labels += milliseconds;
+    timing_stats.assign_labels_calls++;
 
     // Cleanup
     cudaEventDestroy(start);
@@ -377,56 +482,58 @@ void kmeans_assign_labels_cuda(const GpuMat& data, const GpuMat& centers,
 }
 
 void kmeans_update_centers_cuda(const GpuMat& data, const GpuMat& labels,
-                                GpuMat& centers, GpuMat& center_counts,
-                                int K, int blockSize, Stream& stream)
+                               GpuMat& centers, GpuMat& center_counts,
+                               int K, int blockSize, Stream& stream)
 {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, StreamAccessor::getStream(stream));
 
-    const int rows = data.rows;
-
+    // Clear centers and counts
     centers.setTo(Scalar::all(0), stream);
     center_counts.setTo(Scalar::all(0), stream);
 
-    if (blockSize <= 0)
-        blockSize = 256; // Default block size
+    const int BLOCK_DIMS = 16; // Number of dimensions to process per block
+    dim3 block(256, BLOCK_DIMS); // 256 points × 16 dimensions per block
+    
+    // Calculate grid size for points
+    const int grid_x = (data.rows + block.x - 1) / block.x;
+    dim3 grid(grid_x);
 
-    // Ensure blockSize does not exceed device limit
-    int maxThreadsPerBlock;
-    cudaDeviceGetAttribute(&maxThreadsPerBlock, cudaDevAttrMaxThreadsPerBlock, 0);
-    blockSize = std::min(blockSize, maxThreadsPerBlock);
-
-    const dim3 block(blockSize);
-    const dim3 grid((rows + block.x - 1) / block.x);
-
+    // Calculate shared memory size
+    size_t shared_mem_size = (K * BLOCK_DIMS * sizeof(float)) + (K * sizeof(int));
+    
     cudaStream_t cudaStream = StreamAccessor::getStream(stream);
 
-    // Allocate memory for center_counts on device
-    int* d_center_counts = (int*)center_counts.data;
-
-    updateCentersSumKernel<float><<<grid, block, 0, cudaStream>>>(
-        data, labels, centers, d_center_counts, K
-    );
-
-    CV_CUDA_CHECK(cudaGetLastError());
+    // Process centers in chunks of BLOCK_DIMS dimensions
+    for (int dim_offset = 0; dim_offset < data.cols; dim_offset += BLOCK_DIMS) {
+        const int dims_remaining = std::min(BLOCK_DIMS, data.cols - dim_offset);
+        block.y = dims_remaining;
+        
+        updateCentersSumCoalescedKernel<float><<<grid, block, shared_mem_size, cudaStream>>>(
+            data, labels, centers, center_counts.ptr<int>(), K
+        );
+        CV_CUDA_CHECK(cudaGetLastError());
+    }
 
     // Update centers by dividing by counts
-    const dim3 blockMean(blockSize);
+    const dim3 blockMean(256);
     const dim3 gridMean((K + blockMean.x - 1) / blockMean.x);
 
     updateCentersMeanKernel<float><<<gridMean, blockMean, 0, cudaStream>>>(
-        centers, d_center_counts, K
+        centers, center_counts.ptr<int>(), K
     );
 
     CV_CUDA_CHECK(cudaGetLastError());
 
-    cudaEventRecord(stop, StreamAccessor::getStream(stream));
+    // Timing code...
+    cudaEventRecord(stop, cudaStream);
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("kmeans_update_centers_cuda took %f ms\n", milliseconds);
+    timing_stats.kmeans_update_centers += milliseconds;
+    timing_stats.update_centers_calls++;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -560,7 +667,8 @@ void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("kmeans_init_pp_cuda took %f ms\n", milliseconds);
+    timing_stats.kmeans_init_pp += milliseconds;
+    timing_stats.init_pp_calls++;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -620,7 +728,8 @@ double kmeans_center_shift_cuda(const GpuMat& new_centers, const GpuMat& old_cen
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("kmeans_center_shift_cuda took %f ms\n", milliseconds);
+    timing_stats.kmeans_center_shift += milliseconds;
+    timing_stats.center_shift_calls++;
 
     // Cleanup
     cudaEventDestroy(start);
@@ -685,7 +794,8 @@ double kmeans_compute_compactness_cuda(const GpuMat& data, const GpuMat& labels,
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("kmeans_compute_compactness_cuda took %f ms\n", milliseconds);
+    timing_stats.kmeans_compute_compactness += milliseconds;
+    timing_stats.compute_compactness_calls++;
 
     // Cleanup
     cudaEventDestroy(start);
