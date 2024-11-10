@@ -872,6 +872,68 @@ CV_EXPORTS_W Moments moments(InputArray src, const bool binaryImage = false, con
 
 //! @} cudaimgproc_shape
 
+/////////////////////////// KMeans ////////////////////////////////
+
+class CV_EXPORTS_W KMeans : public Algorithm
+{
+public:
+    /** @brief Finds centers of clusters using GPU acceleration.
+     *
+     * @param data Input data (GpuMat of CV_32F type). Points are stored as rows.
+     * @param K Number of clusters to split the set by.
+     * @param bestLabels Output integer array that stores the cluster indices for every sample (GpuMat of CV_32S type).
+     * @param criteria The algorithm termination criteria.
+     * @param centers Output matrix of the cluster centers (GpuMat of CV_32F type).
+     * @param stream CUDA stream for asynchronous execution.
+     * @return The compactness measure.
+     */
+    CV_WRAP virtual double cluster(InputArray data, 
+                                 int K,
+                                 InputOutputArray bestLabels,
+                                 TermCriteria criteria,
+                                 OutputArray centers = noArray(),
+                                 Stream& stream = Stream::Null()) = 0;
+
+    /** @brief Gets/sets initialization method */
+    CV_WRAP virtual int getInitMethod() const = 0;
+    CV_WRAP virtual void setInitMethod(int method) = 0;
+
+    /** @brief Gets/sets number of attempts */
+    CV_WRAP virtual int getAttempts() const = 0;
+    CV_WRAP virtual void setAttempts(int attempts) = 0;
+
+    /** @brief Gets/sets distance type */
+    CV_WRAP virtual int getDistanceType() const = 0;
+    CV_WRAP virtual void setDistanceType(int distType) = 0;
+
+    /** @brief Gets/sets CUDA block size */
+    CV_WRAP virtual int getBlockSize() const = 0;
+    CV_WRAP virtual void setBlockSize(int blockSize) = 0;
+};
+
+/** @brief Creates implementation for GPU-accelerated K-means clustering
+ *
+ * @param initMethod Method to initialize cluster centers. Supports combination of the following flags:
+ *                   KMEANS_RANDOM_CENTERS - Select random points as initial centers
+ *                   KMEANS_PP_CENTERS - Use k-means++ algorithm for center initialization
+ *                   KMEANS_USE_INITIAL_LABELS - Use the user-supplied labels during the first attempt
+ *                                              instead of computing them from the initial centers.
+ *                                              (Can be combined with KMEANS_PP_CENTERS or KMEANS_RANDOM_CENTERS)
+ * @param attempts Number of times the algorithm is executed using different initial centers.
+ *                The algorithm returns the labels that yield the best compactness.
+ *                Must be greater than or equal to 1.
+ * @param distType Distance measure type used for computing distances between points and centers:
+ *                 DIST_L1 - L1 distance (sum of absolute differences)
+ *                 DIST_L2 - L2 distance (Euclidean distance, default)
+ * @param blockSize Size of thread block for CUDA kernel execution. If 0, the size will be
+ *                 automatically selected based on device capabilities.
+ *                 For advanced users only.
+ * @return Pointer to the newly created kmeans algorithm
+ */
+CV_EXPORTS_W Ptr<KMeans> createKMeans(int initMethod = KMEANS_PP_CENTERS,
+                                     int attempts = 3,
+                                     int distType = cv::DIST_L2,
+                                     int blockSize = 0);
 }} // namespace cv { namespace cuda {
 
 #endif /* OPENCV_CUDAIMGPROC_HPP */
