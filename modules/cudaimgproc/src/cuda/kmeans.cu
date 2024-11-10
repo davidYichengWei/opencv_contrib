@@ -224,6 +224,49 @@ __global__ void elementWiseMinKernel(const float* src1, const float* src2, float
     }
 }
 
+// Add this kernel before kmeans_init_pp_cuda
+__global__ void selectNextCenterKernel(
+    const float* distances,
+    const float total_dist,
+    const float random_value,
+    int* selected_center,
+    const int N
+) {
+    extern __shared__ float s_data[];
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int idx = bid * blockDim.x + tid;
+
+    // Load distances into shared memory
+    float local_sum = 0.0f;
+    if (idx < N) {
+        local_sum = distances[idx];
+    }
+    s_data[tid] = local_sum;
+    __syncthreads();
+
+    // Compute prefix sum in shared memory
+    for (unsigned int stride = 1; stride < blockDim.x; stride *= 2) {
+        float temp = 0.0f;
+        if (tid >= stride) {
+            temp = s_data[tid - stride];
+        }
+        __syncthreads();
+        if (tid >= stride) {
+            s_data[tid] += temp;
+        }
+        __syncthreads();
+    }
+
+    // Find the index where cumulative sum exceeds random_value
+    if (idx < N) {
+        float cumsum = s_data[tid] + (bid > 0 ? distances[bid * blockDim.x - 1] : 0.0f);
+        if (cumsum >= random_value && (tid == 0 || s_data[tid-1] < random_value)) {
+            atomicMin(selected_center, idx);
+        }
+    }
+}
+
 } // namespace
 
 // Implementation of CUDA interface functions
@@ -283,6 +326,12 @@ void kmeans_assign_labels_cuda(const GpuMat& data, const GpuMat& centers,
                                GpuMat& labels, GpuMat& distances,
                                int distType, int blockSize, Stream& stream)
 {
+    // Create and record start event
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, StreamAccessor::getStream(stream));
+
     CV_Assert(data.type() == CV_32F);
     CV_Assert(centers.type() == CV_32F);
 
@@ -314,12 +363,28 @@ void kmeans_assign_labels_cuda(const GpuMat& data, const GpuMat& centers,
     );
 
     CV_CUDA_CHECK(cudaGetLastError());
+
+    // Record stop event and calculate time
+    cudaEventRecord(stop, StreamAccessor::getStream(stream));
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("kmeans_assign_labels_cuda took %f ms\n", milliseconds);
+
+    // Cleanup
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
 void kmeans_update_centers_cuda(const GpuMat& data, const GpuMat& labels,
                                 GpuMat& centers, GpuMat& center_counts,
                                 int K, int blockSize, Stream& stream)
 {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, StreamAccessor::getStream(stream));
+
     const int rows = data.rows;
 
     centers.setTo(Scalar::all(0), stream);
@@ -356,6 +421,15 @@ void kmeans_update_centers_cuda(const GpuMat& data, const GpuMat& labels,
     );
 
     CV_CUDA_CHECK(cudaGetLastError());
+
+    cudaEventRecord(stop, StreamAccessor::getStream(stream));
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("kmeans_update_centers_cuda took %f ms\n", milliseconds);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
 void kmeans_random_center_init_cuda(const GpuMat& data, int K, GpuMat& centers, RNG& rng, Stream& stream)
@@ -394,6 +468,11 @@ void kmeans_random_center_init_cuda(const GpuMat& data, int K, GpuMat& centers, 
 void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
                          GpuMat& distances, RNG& rng, int blockSize, Stream& stream)
 {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, StreamAccessor::getStream(stream));
+
     const int N = data.rows;
 
     // Initialize first center randomly
@@ -401,72 +480,101 @@ void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
     data.row(center_idx).copyTo(centers.row(0), stream);
 
     if (blockSize <= 0)
-        blockSize = 256; // Default block size
+        blockSize = 256;
 
     // Ensure blockSize does not exceed device limit
     int maxThreadsPerBlock;
     cudaDeviceGetAttribute(&maxThreadsPerBlock, cudaDevAttrMaxThreadsPerBlock, 0);
     blockSize = std::min(blockSize, maxThreadsPerBlock);
 
+    // Allocate GPU memory
     GpuMat closest_distances(N, 1, CV_32F);
-
-    // Use custom function to initialize closest_distances
-    initializeClosestDistances(closest_distances, FLT_MAX, stream);
-
-    // Allocate temp_labels and distances
     GpuMat temp_labels(N, 1, CV_32S);
+    GpuMat d_total_dist(1, 1, CV_32F);
+    GpuMat d_selected_center(1, 1, CV_32S);
     distances.create(N, 1, CV_32F);
 
-    for (int k = 1; k < K; k++) {
-        // Assign labels to the closest center
-        kmeans_assign_labels_cuda(data, centers.rowRange(0, k),
-                                  temp_labels, distances,
-                                  DistanceTypes::DIST_L2, blockSize, stream);
+    // Initialize distances
+    initializeClosestDistances(closest_distances, FLT_MAX, stream);
 
-        // Update closest distances using custom element-wise min
+    // Ensure shared memory size doesn't exceed device limit
+    size_t sharedMemSize = blockSize * sizeof(float);
+    int maxSharedMemPerBlock;
+    cudaDeviceGetAttribute(&maxSharedMemPerBlock, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    if (sharedMemSize > (size_t)maxSharedMemPerBlock) {
+        sharedMemSize = maxSharedMemPerBlock;
+        blockSize = sharedMemSize / sizeof(float);
+    }
+
+    const dim3 block(blockSize);
+    const dim3 grid((N + block.x - 1) / block.x);
+    cudaStream_t cudaStream = StreamAccessor::getStream(stream);
+
+    for (int k = 1; k < K; k++) {
+        // Assign labels to closest centers
+        kmeans_assign_labels_cuda(data, centers.rowRange(0, k),
+                                 temp_labels, distances,
+                                 DistanceTypes::DIST_L2, blockSize, stream);
+
+        // Update closest distances
         elementWiseMin(closest_distances, distances, closest_distances, stream);
 
-        // Synchronize the stream before proceeding
+        // Compute total distance on GPU
+        cv::cuda::reduce(closest_distances, d_total_dist, 0, cv::REDUCE_SUM, CV_32F, stream);
+
+        // Get total distance
+        float total_dist;
+        stream.waitForCompletion();
+        cudaMemcpyAsync(&total_dist, d_total_dist.ptr<float>(), sizeof(float),
+                       cudaMemcpyDeviceToHost, cudaStream);
         stream.waitForCompletion();
 
-        // Copy closest distances to host
-        Mat h_closest_distances;
-        closest_distances.download(h_closest_distances, stream);
+        // Generate random value
+        float r = static_cast<float>(rng.uniform(0.0, static_cast<double>(total_dist)));
+
+        // Select new center on GPU
+        d_selected_center.setTo(Scalar(N), stream);
+
+        selectNextCenterKernel<<<grid, block, sharedMemSize, cudaStream>>>(
+            closest_distances.ptr<float>(), total_dist, r,
+            d_selected_center.ptr<int>(), N
+        );
+        CV_CUDA_CHECK(cudaGetLastError());
+
+        // Get selected center index
+        int new_center_idx;
+        stream.waitForCompletion();
+        cudaMemcpyAsync(&new_center_idx, d_selected_center.ptr<int>(), sizeof(int),
+                       cudaMemcpyDeviceToHost, cudaStream);
         stream.waitForCompletion();
 
-        // Compute total distance on host
-        double total_dist = cv::sum(h_closest_distances)[0];
-
-        // Generate a random value in [0, total_dist)
-        double r = rng.uniform(0.0, total_dist);
-
-        // Find the index where cumulative distance exceeds r
-        double cumulative = 0.0;
-        int new_center_idx = -1;
-        for (int i = 0; i < N; ++i) {
-            cumulative += h_closest_distances.at<float>(i, 0);
-            if (cumulative >= r) {
-                new_center_idx = i;
-                break;
-            }
-        }
-
-        if (new_center_idx == -1) {
-            new_center_idx = N - 1; // Fallback
+        if (new_center_idx >= N) {
+            new_center_idx = N - 1; // Fallback if no valid center found
         }
 
         // Copy the new center
         data.row(new_center_idx).copyTo(centers.row(k), stream);
-
-        // Re-initialize distances to FLT_MAX for the next iteration
-        initializeClosestDistances(closest_distances, FLT_MAX, stream);
     }
-}
 
+    cudaEventRecord(stop, StreamAccessor::getStream(stream));
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("kmeans_init_pp_cuda took %f ms\n", milliseconds);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
 
 double kmeans_center_shift_cuda(const GpuMat& new_centers, const GpuMat& old_centers,
                                 int distType, int blockSize, Stream& stream)
 {
+    // Create and record start event
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, StreamAccessor::getStream(stream));
+
     const int K = new_centers.rows;
 
     GpuMat d_total_shift(1, 1, CV_32F);
@@ -507,6 +615,17 @@ double kmeans_center_shift_cuda(const GpuMat& new_centers, const GpuMat& old_cen
     cudaMemcpyAsync(&total_shift, d_total_shift.ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost, cudaStream);
     stream.waitForCompletion();
 
+    // Record stop event and calculate time
+    cudaEventRecord(stop, cudaStream);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("kmeans_center_shift_cuda took %f ms\n", milliseconds);
+
+    // Cleanup
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
     return static_cast<double>(total_shift);
 }
 
@@ -514,6 +633,12 @@ double kmeans_compute_compactness_cuda(const GpuMat& data, const GpuMat& labels,
                                        const GpuMat& centers, GpuMat& distances,
                                        int distType, int blockSize, Stream& stream)
 {
+    // Create and record start event
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, StreamAccessor::getStream(stream));
+
     const int N = data.rows;
 
     if (blockSize <= 0)
@@ -554,6 +679,17 @@ double kmeans_compute_compactness_cuda(const GpuMat& data, const GpuMat& labels,
     float compactness = 0.0f;
     cudaMemcpyAsync(&compactness, d_compactness.ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost, cudaStream);
     stream.waitForCompletion();
+
+    // Record stop event and calculate time
+    cudaEventRecord(stop, cudaStream);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("kmeans_compute_compactness_cuda took %f ms\n", milliseconds);
+
+    // Cleanup
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     return static_cast<double>(compactness);
 }
