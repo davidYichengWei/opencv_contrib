@@ -208,7 +208,6 @@ __global__ void elementWiseMinKernel(const float* src1, const float* src2, float
     }
 }
 
-// Add this kernel before kmeans_init_pp_cuda
 __global__ void selectNextCenterKernel(
     const float* distances,
     const float total_dist,
@@ -229,24 +228,23 @@ __global__ void selectNextCenterKernel(
     s_data[tid] = local_sum;
     __syncthreads();
 
-    // Compute prefix sum in shared memory
-    for (unsigned int stride = 1; stride < blockDim.x; stride *= 2) {
-        float temp = 0.0f;
-        if (tid >= stride) {
-            temp = s_data[tid - stride];
-        }
-        __syncthreads();
-        if (tid >= stride) {
-            s_data[tid] += temp;
-        }
-        __syncthreads();
+    // Compute exclusive prefix sum in shared memory
+    float running_sum = 0.0f;
+    for (int i = 0; i < blockDim.x; i++) {
+        float val = s_data[i];
+        s_data[i] = running_sum;
+        running_sum += val;
     }
+    __syncthreads();
 
-    // Find the index where cumulative sum exceeds random_value
+    // Each thread checks if the random value falls in its range
     if (idx < N) {
-        float cumsum = s_data[tid] + (bid > 0 ? distances[bid * blockDim.x - 1] : 0.0f);
-        if (cumsum >= random_value && (tid == 0 || s_data[tid-1] < random_value)) {
-            atomicMin(selected_center, idx);
+        float prev_sum = (bid > 0) ? distances[bid * blockDim.x - 1] : 0.0f;
+        float my_start = prev_sum + s_data[tid];
+        float my_end = prev_sum + s_data[tid] + local_sum;
+        
+        if (random_value >= my_start && random_value < my_end) {
+            atomicExch(selected_center, idx);  // Use exchange instead of min
         }
     }
 }
