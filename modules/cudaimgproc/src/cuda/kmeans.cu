@@ -30,6 +30,10 @@ namespace {
 const int KMEANS_DIST_L1 = 1;
 const int KMEANS_DIST_L2 = 2;
 
+// Define constants for shared memory and vectorized load optimization
+#define TILE_DIM 32
+#define MAX_DIMS 256  // Adjust based on your use case
+
 // Utility function to compute L1/L2 distance between points
 template<typename T>
 __device__ float computeDistance(const T* a, const T* b, int dims, int distType) {
@@ -53,23 +57,91 @@ __global__ void assignCentersKernel(
     PtrStepSz<float> distances,
     const int distType
 ) {
-    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= data.rows) return;
+    extern __shared__ float s_centers[];  // [K][D] layout
+    const int tid = threadIdx.x;
+    const int point_idx = blockIdx.x * blockDim.x + tid;
+    
+    // Collaborative loading of centers into shared memory
+    const int centers_per_thread = (centers.rows + blockDim.x - 1) / blockDim.x;
+    const int vec4_dims = centers.cols / 4;
+    const int remaining_dims = centers.cols % 4;
 
-    float minDist = FLT_MAX;
-    int minLabel = 0;
+    for (int k = 0; k < centers_per_thread; k++) {
+        const int center_idx = k * blockDim.x + tid;
+        if (center_idx < centers.rows) {
+            // Use float4 for vectorized loads
+            const float4* center_vec = (float4*)centers.ptr(center_idx);
+            float* shared_center = &s_centers[center_idx * centers.cols];
+            
+            // Load chunks of 4 floats at a time
+            #pragma unroll
+            for (int d = 0; d < vec4_dims; d++) {
+                float4 vec_data = center_vec[d];
+                shared_center[d * 4] = vec_data.x;
+                shared_center[d * 4 + 1] = vec_data.y;
+                shared_center[d * 4 + 2] = vec_data.z;
+                shared_center[d * 4 + 3] = vec_data.w;
+            }
+            
+            // Load remaining dimensions
+            for (int d = vec4_dims * 4; d < centers.cols; d++) {
+                shared_center[d] = centers.ptr(center_idx)[d];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (point_idx >= data.rows) return;
+
+    // Load current point data using vectorized loads
+    float point_data[MAX_DIMS];
+    const float4* point_vec = (float4*)data.ptr(point_idx);
+    
+    #pragma unroll
+    for (int d = 0; d < vec4_dims; d++) {
+        float4 vec_data = point_vec[d];
+        point_data[d * 4] = vec_data.x;
+        point_data[d * 4 + 1] = vec_data.y;
+        point_data[d * 4 + 2] = vec_data.z;
+        point_data[d * 4 + 3] = vec_data.w;
+    }
+    
+    for (int d = vec4_dims * 4; d < data.cols; d++) {
+        point_data[d] = data.ptr(point_idx)[d];
+    }
 
     // Find nearest center
+    float min_dist = FLT_MAX;
+    int min_label = 0;
+
+    #pragma unroll(16)  // Unroll for common K values
     for (int k = 0; k < centers.rows; k++) {
-        float dist = computeDistance(data.ptr(idx), centers.ptr(k), data.cols, distType);
-        if (dist < minDist) {
-            minDist = dist;
-            minLabel = k;
+        float dist = 0.0f;
+        const float* center = &s_centers[k * centers.cols];
+
+        if (distType == KMEANS_DIST_L1) {
+            #pragma unroll
+            for (int d = 0; d < centers.cols; d++) {
+                dist += fabsf(point_data[d] - center[d]);
+            }
+        } else {  // L2 distance
+            #pragma unroll
+            for (int d = 0; d < centers.cols; d++) {
+                float diff = point_data[d] - center[d];
+                dist += diff * diff;
+            }
+            dist = sqrtf(dist);
+        }
+
+        if (dist < min_dist) {
+            min_dist = dist;
+            min_label = k;
         }
     }
 
-    labels(idx, 0) = minLabel;
-    distances(idx, 0) = minDist;
+    // Write results
+    labels(point_idx, 0) = min_label;
+    distances(point_idx, 0) = min_dist;
 }
 
 // Kernel for computing center means
@@ -424,10 +496,15 @@ void elementWiseMin(const GpuMat& src1, const GpuMat& src2, GpuMat& dst, Stream&
     CV_CUDA_CHECK(cudaGetLastError());
 }
 
-void kmeans_assign_labels_cuda(const GpuMat& data, const GpuMat& centers,
-                               GpuMat& labels, GpuMat& distances,
-                               int distType, int blockSize, Stream& stream)
-{
+void kmeans_assign_labels_cuda(
+    const GpuMat& data,
+    const GpuMat& centers,
+    GpuMat& labels,
+    GpuMat& distances,
+    int distType,
+    int blockSize,
+    Stream& stream
+) {
     // Create and record start event
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -440,27 +517,34 @@ void kmeans_assign_labels_cuda(const GpuMat& data, const GpuMat& centers,
     int cudaDistType = (distType == DistanceTypes::DIST_L1) ? KMEANS_DIST_L1 : KMEANS_DIST_L2;
 
     const int rows = data.rows;
-
-    // Ensure labels and distances are allocated
-    if (labels.empty() || labels.rows != rows || labels.cols != 1)
-        labels.create(rows, 1, CV_32S);
-    if (distances.empty() || distances.rows != rows || distances.cols != 1)
-        distances.create(rows, 1, CV_32F);
-
+    
     if (blockSize <= 0)
-        blockSize = 256; // Default block size
+        blockSize = 256;
 
-    // Ensure blockSize does not exceed device limit
+    // Ensure blockSize doesn't exceed device limits
     int maxThreadsPerBlock;
     cudaDeviceGetAttribute(&maxThreadsPerBlock, cudaDevAttrMaxThreadsPerBlock, 0);
     blockSize = std::min(blockSize, maxThreadsPerBlock);
 
-    const dim3 block(blockSize);
-    const dim3 grid((rows + block.x - 1) / block.x);
+    // Calculate shared memory size for centers
+    size_t shared_mem_size = centers.rows * centers.cols * sizeof(float);
+    
+    // Check shared memory limits
+    int maxSharedMemPerBlock;
+    cudaDeviceGetAttribute(&maxSharedMemPerBlock, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    if (shared_mem_size > (size_t)maxSharedMemPerBlock) {
+        // Fallback to original implementation if shared memory is insufficient
+        blockSize = 256;
+        shared_mem_size = 0;
+    }
+
+    dim3 block(blockSize);
+    dim3 grid((rows + block.x - 1) / block.x);
 
     cudaStream_t cudaStream = StreamAccessor::getStream(stream);
 
-    assignCentersKernel<float><<<grid, block, 0, cudaStream>>>(
+    // Launch kernel with shared memory
+    assignCentersKernel<float><<<grid, block, shared_mem_size, cudaStream>>>(
         data, centers, labels, distances, cudaDistType
     );
 
