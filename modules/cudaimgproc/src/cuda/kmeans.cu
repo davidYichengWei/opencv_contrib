@@ -441,6 +441,79 @@ extern "C" void printTimingStats() {
            timing_stats.kmeans_compute_compactness);
 }
 
+__global__ void parallelReduceKernel(
+    const float* input,
+    float* output,
+    int N
+) {
+    extern __shared__ float sdata[];
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+    
+    // Load first round of data into shared memory
+    float sum = (i < N) ? input[i] : 0;
+    if (i + blockDim.x < N) 
+        sum += input[i + blockDim.x];
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Do reduction in shared memory
+    #pragma unroll
+    for (unsigned int s = blockDim.x/2; s > 32; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Unroll last 6 iterations (warp)
+    if (tid < 32) {
+        volatile float* smem = sdata;
+        if (blockDim.x >= 64) smem[tid] += smem[tid + 32];
+        if (blockDim.x >= 32) smem[tid] += smem[tid + 16];
+        if (blockDim.x >= 16) smem[tid] += smem[tid + 8];
+        if (blockDim.x >= 8) smem[tid] += smem[tid + 4];
+        if (blockDim.x >= 4) smem[tid] += smem[tid + 2];
+        if (blockDim.x >= 2) smem[tid] += smem[tid + 1];
+    }
+
+    // Write result for this block to global mem
+    if (tid == 0) output[blockIdx.x] = sdata[0];
+}
+
+float customReduceSum(const GpuMat& input, Stream& stream) {
+    const int N = input.rows * input.cols;
+    const int threadsPerBlock = 256;
+    const int blocksPerGrid = (N + (threadsPerBlock * 2 - 1)) / (threadsPerBlock * 2);
+    
+    // Allocate temporary storage for block results
+    GpuMat blockSums(1, blocksPerGrid, CV_32F);
+    
+    cudaStream_t cudaStream = StreamAccessor::getStream(stream);
+    
+    // First reduction pass
+    parallelReduceKernel<<<blocksPerGrid, threadsPerBlock, threadsPerBlock * sizeof(float), cudaStream>>>(
+        input.ptr<float>(), blockSums.ptr<float>(), N
+    );
+    
+    // If we have more than one block, do a second pass
+    float total_sum;
+    if (blocksPerGrid > 1) {
+        GpuMat finalSum(1, 1, CV_32F);
+        parallelReduceKernel<<<1, threadsPerBlock, threadsPerBlock * sizeof(float), cudaStream>>>(
+            blockSums.ptr<float>(), finalSum.ptr<float>(), blocksPerGrid
+        );
+        cudaMemcpyAsync(&total_sum, finalSum.ptr<float>(), sizeof(float), 
+                        cudaMemcpyDeviceToHost, cudaStream);
+    } else {
+        cudaMemcpyAsync(&total_sum, blockSums.ptr<float>(), sizeof(float), 
+                        cudaMemcpyDeviceToHost, cudaStream);
+    }
+    
+    stream.waitForCompletion();
+    return total_sum;
+}
+
 } // namespace
 
 // Implementation of CUDA interface functions
@@ -709,14 +782,7 @@ void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
         elementWiseMin(closest_distances, distances, closest_distances, stream);
 
         // Compute total distance on GPU
-        cv::cuda::reduce(closest_distances, d_total_dist, 0, cv::REDUCE_SUM, CV_32F, stream);
-
-        // Get total distance
-        float total_dist;
-        stream.waitForCompletion();
-        cudaMemcpyAsync(&total_dist, d_total_dist.ptr<float>(), sizeof(float),
-                       cudaMemcpyDeviceToHost, cudaStream);
-        stream.waitForCompletion();
+        float total_dist = customReduceSum(closest_distances, stream);
 
         // Generate random value
         float r = static_cast<float>(rng.uniform(0.0, static_cast<double>(total_dist)));
