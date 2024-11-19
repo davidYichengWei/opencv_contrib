@@ -57,35 +57,21 @@ __global__ void assignCentersKernel(
     PtrStepSz<float> distances,
     const int distType
 ) {
-    extern __shared__ float s_centers[];  // [K][D] layout
+    extern __shared__ float s_centers[];
     const int tid = threadIdx.x;
     const int point_idx = blockIdx.x * blockDim.x + tid;
     
-    // Collaborative loading of centers into shared memory
+    // Load centers into shared memory - handle each channel separately
     const int centers_per_thread = (centers.rows + blockDim.x - 1) / blockDim.x;
-    const int vec4_dims = centers.cols / 4;
-    const int remaining_dims = centers.cols % 4;
-
+    
+    // Load centers into shared memory
+    #pragma unroll
     for (int k = 0; k < centers_per_thread; k++) {
         const int center_idx = k * blockDim.x + tid;
         if (center_idx < centers.rows) {
-            // Use float4 for vectorized loads
-            const float4* center_vec = (float4*)centers.ptr(center_idx);
-            float* shared_center = &s_centers[center_idx * centers.cols];
-            
-            // Load chunks of 4 floats at a time
-            #pragma unroll
-            for (int d = 0; d < vec4_dims; d++) {
-                float4 vec_data = center_vec[d];
-                shared_center[d * 4] = vec_data.x;
-                shared_center[d * 4 + 1] = vec_data.y;
-                shared_center[d * 4 + 2] = vec_data.z;
-                shared_center[d * 4 + 3] = vec_data.w;
-            }
-            
-            // Load remaining dimensions
-            for (int d = vec4_dims * 4; d < centers.cols; d++) {
-                shared_center[d] = centers.ptr(center_idx)[d];
+            // Load each channel separately to preserve exact values
+            for (int c = 0; c < 3; c++) {
+                s_centers[center_idx * 3 + c] = centers(center_idx, c);
             }
         }
     }
@@ -93,44 +79,28 @@ __global__ void assignCentersKernel(
 
     if (point_idx >= data.rows) return;
 
-    // Load current point data using vectorized loads
-    float point_data[MAX_DIMS];
-    const float4* point_vec = (float4*)data.ptr(point_idx);
-    
-    #pragma unroll
-    for (int d = 0; d < vec4_dims; d++) {
-        float4 vec_data = point_vec[d];
-        point_data[d * 4] = vec_data.x;
-        point_data[d * 4 + 1] = vec_data.y;
-        point_data[d * 4 + 2] = vec_data.z;
-        point_data[d * 4 + 3] = vec_data.w;
-    }
-    
-    for (int d = vec4_dims * 4; d < data.cols; d++) {
-        point_data[d] = data.ptr(point_idx)[d];
-    }
-
-    // Find nearest center
     float min_dist = FLT_MAX;
-    int min_label = 0;
+    int min_label = -1;
+    
+    // Load point data once
+    float point_channels[3];
+    for (int c = 0; c < 3; c++) {
+        point_channels[c] = data(point_idx, c);
+    }
 
-    #pragma unroll(16)  // Unroll for common K values
+    // Process all centers
+    #pragma unroll
     for (int k = 0; k < centers.rows; k++) {
-        float dist = 0.0f;
-        const float* center = &s_centers[k * centers.cols];
-
+        float dist;
         if (distType == KMEANS_DIST_L1) {
-            #pragma unroll
-            for (int d = 0; d < centers.cols; d++) {
-                dist += fabsf(point_data[d] - center[d]);
-            }
+            dist = fabsf(point_channels[0] - s_centers[k * 3 + 0]) + 
+                   fabsf(point_channels[1] - s_centers[k * 3 + 1]) + 
+                   fabsf(point_channels[2] - s_centers[k * 3 + 2]);
         } else {  // L2 distance
-            #pragma unroll
-            for (int d = 0; d < centers.cols; d++) {
-                float diff = point_data[d] - center[d];
-                dist += diff * diff;
-            }
-            dist = sqrtf(dist);
+            float dx = point_channels[0] - s_centers[k * 3 + 0];
+            float dy = point_channels[1] - s_centers[k * 3 + 1];
+            float dz = point_channels[2] - s_centers[k * 3 + 2];
+            dist = sqrtf(dx * dx + dy * dy + dz * dz);
         }
 
         if (dist < min_dist) {
@@ -583,46 +553,41 @@ void kmeans_assign_labels_cuda(
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, StreamAccessor::getStream(stream));
-
+    
     CV_Assert(data.type() == CV_32F);
     CV_Assert(centers.type() == CV_32F);
-
     int cudaDistType = (distType == DistanceTypes::DIST_L1) ? KMEANS_DIST_L1 : KMEANS_DIST_L2;
-
     const int rows = data.rows;
     
     if (blockSize <= 0)
-        blockSize = 256;
+        blockSize = 512;
 
-    // Ensure blockSize doesn't exceed device limits
+    // Device limits check
     int maxThreadsPerBlock;
     cudaDeviceGetAttribute(&maxThreadsPerBlock, cudaDevAttrMaxThreadsPerBlock, 0);
     blockSize = std::min(blockSize, maxThreadsPerBlock);
-
-    // Calculate shared memory size for centers
-    size_t shared_mem_size = centers.rows * centers.cols * sizeof(float);
     
-    // Check shared memory limits
+    // Calculate shared memory size for centers
+    size_t shared_mem_size = centers.rows * sizeof(float3);
     int maxSharedMemPerBlock;
     cudaDeviceGetAttribute(&maxSharedMemPerBlock, cudaDevAttrMaxSharedMemoryPerBlock, 0);
     if (shared_mem_size > (size_t)maxSharedMemPerBlock) {
-        // Fallback to original implementation if shared memory is insufficient
         blockSize = 256;
         shared_mem_size = 0;
     }
-
+    
     dim3 block(blockSize);
     dim3 grid((rows + block.x - 1) / block.x);
-
     cudaStream_t cudaStream = StreamAccessor::getStream(stream);
-
+    
     // Launch kernel with shared memory
     assignCentersKernel<float><<<grid, block, shared_mem_size, cudaStream>>>(
         data, centers, labels, distances, cudaDistType
     );
+    cudaStreamSynchronize(cudaStream);
 
     CV_CUDA_CHECK(cudaGetLastError());
-
+    
     // Record stop event and calculate time
     cudaEventRecord(stop, StreamAccessor::getStream(stream));
     cudaEventSynchronize(stop);
