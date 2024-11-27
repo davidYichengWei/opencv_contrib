@@ -21,7 +21,6 @@ Ptr<cv::cuda::KMeans> cv::cuda::createKMeans(int, int, int, int)
 #else /* !defined (HAVE_CUDA) */
 
 // Forward declarations of CUDA functions
-extern "C" void printTimingStats();
 void kmeans_cuda(const GpuMat& data, int K, GpuMat& labels, GpuMat& centers,
                  GpuMat& distances, int distType, int blockSize, Stream& stream);
 void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
@@ -160,9 +159,6 @@ public:
 
         // Ensure all CUDA operations are completed
         stream.waitForCompletion();
-
-        // Add timing stats print here
-        printTimingStats();
 
         return best_compactness;
     }

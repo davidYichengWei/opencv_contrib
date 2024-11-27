@@ -19,11 +19,6 @@ inline void __opencv_cuda_check(cudaError_t err, const char *file, const int lin
     }
 }
 
-// Forward declarations
-extern "C" {
-    void printTimingStats();
-}
-
 namespace {
 
 // Define distance constants for device code
@@ -366,51 +361,6 @@ __global__ void updateCentersSumCoalescedKernel(
     }
 }
 
-struct TimingStats {
-    float kmeans_init_pp = 0;
-    float kmeans_assign_labels = 0;
-    float kmeans_update_centers = 0;
-    float kmeans_center_shift = 0;
-    float kmeans_compute_compactness = 0;
-    int init_pp_calls = 0;
-    int assign_labels_calls = 0;
-    int update_centers_calls = 0;
-    int center_shift_calls = 0;
-    int compute_compactness_calls = 0;
-};
-
-static TimingStats timing_stats;
-
-extern "C" void printTimingStats() {
-    printf("\nKMeans CUDA Timing Summary:\n");
-    printf("kmeans_init_pp_cuda:           %.2f ms (avg %.2f ms over %d calls)\n", 
-           timing_stats.kmeans_init_pp,
-           timing_stats.kmeans_init_pp / timing_stats.init_pp_calls,
-           timing_stats.init_pp_calls);
-    printf("kmeans_assign_labels_cuda:     %.2f ms (avg %.2f ms over %d calls)\n", 
-           timing_stats.kmeans_assign_labels,
-           timing_stats.kmeans_assign_labels / timing_stats.assign_labels_calls,
-           timing_stats.assign_labels_calls);
-    printf("kmeans_update_centers_cuda:    %.2f ms (avg %.2f ms over %d calls)\n", 
-           timing_stats.kmeans_update_centers,
-           timing_stats.kmeans_update_centers / timing_stats.update_centers_calls,
-           timing_stats.update_centers_calls);
-    printf("kmeans_center_shift_cuda:      %.2f ms (avg %.2f ms over %d calls)\n", 
-           timing_stats.kmeans_center_shift,
-           timing_stats.kmeans_center_shift / timing_stats.center_shift_calls,
-           timing_stats.center_shift_calls);
-    printf("kmeans_compute_compactness_cuda: %.2f ms (avg %.2f ms over %d calls)\n", 
-           timing_stats.kmeans_compute_compactness,
-           timing_stats.kmeans_compute_compactness / timing_stats.compute_compactness_calls,
-           timing_stats.compute_compactness_calls);
-    printf("Total CUDA kernel time: %.2f ms\n\n",
-           timing_stats.kmeans_init_pp + 
-           timing_stats.kmeans_assign_labels +
-           timing_stats.kmeans_update_centers + 
-           timing_stats.kmeans_center_shift +
-           timing_stats.kmeans_compute_compactness);
-}
-
 __global__ void parallelReduceKernel(
     const float* input,
     float* output,
@@ -548,12 +498,6 @@ void kmeans_assign_labels_cuda(
     int blockSize,
     Stream& stream
 ) {
-    // Create and record start event
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, StreamAccessor::getStream(stream));
-    
     CV_Assert(data.type() == CV_32F);
     CV_Assert(centers.type() == CV_32F);
     int cudaDistType = (distType == DistanceTypes::DIST_L1) ? KMEANS_DIST_L1 : KMEANS_DIST_L2;
@@ -587,29 +531,12 @@ void kmeans_assign_labels_cuda(
     cudaStreamSynchronize(cudaStream);
 
     CV_CUDA_CHECK(cudaGetLastError());
-    
-    // Record stop event and calculate time
-    cudaEventRecord(stop, StreamAccessor::getStream(stream));
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    timing_stats.kmeans_assign_labels += milliseconds;
-    timing_stats.assign_labels_calls++;
-
-    // Cleanup
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 }
 
 void kmeans_update_centers_cuda(const GpuMat& data, const GpuMat& labels,
                                GpuMat& centers, GpuMat& center_counts,
                                int K, int blockSize, Stream& stream)
 {
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, StreamAccessor::getStream(stream));
-
     // Clear centers and counts
     centers.setTo(Scalar::all(0), stream);
     center_counts.setTo(Scalar::all(0), stream);
@@ -646,17 +573,6 @@ void kmeans_update_centers_cuda(const GpuMat& data, const GpuMat& labels,
     );
 
     CV_CUDA_CHECK(cudaGetLastError());
-
-    // Timing code...
-    cudaEventRecord(stop, cudaStream);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    timing_stats.kmeans_update_centers += milliseconds;
-    timing_stats.update_centers_calls++;
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 }
 
 void kmeans_random_center_init_cuda(const GpuMat& data, int K, GpuMat& centers, RNG& rng, Stream& stream)
@@ -695,11 +611,6 @@ void kmeans_random_center_init_cuda(const GpuMat& data, int K, GpuMat& centers, 
 void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
                          GpuMat& distances, RNG& rng, int blockSize, Stream& stream)
 {
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, StreamAccessor::getStream(stream));
-
     const int N = data.rows;
 
     // Initialize first center randomly
@@ -775,27 +686,11 @@ void kmeans_init_pp_cuda(const GpuMat& data, int K, GpuMat& centers,
         // Copy the new center
         data.row(new_center_idx).copyTo(centers.row(k), stream);
     }
-
-    cudaEventRecord(stop, StreamAccessor::getStream(stream));
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    timing_stats.kmeans_init_pp += milliseconds;
-    timing_stats.init_pp_calls++;
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 }
 
 double kmeans_center_shift_cuda(const GpuMat& new_centers, const GpuMat& old_centers,
                                 int distType, int blockSize, Stream& stream)
 {
-    // Create and record start event
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, StreamAccessor::getStream(stream));
-
     const int K = new_centers.rows;
 
     GpuMat d_total_shift(1, 1, CV_32F);
@@ -836,18 +731,6 @@ double kmeans_center_shift_cuda(const GpuMat& new_centers, const GpuMat& old_cen
     cudaMemcpyAsync(&total_shift, d_total_shift.ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost, cudaStream);
     stream.waitForCompletion();
 
-    // Record stop event and calculate time
-    cudaEventRecord(stop, cudaStream);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    timing_stats.kmeans_center_shift += milliseconds;
-    timing_stats.center_shift_calls++;
-
-    // Cleanup
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
     return static_cast<double>(total_shift);
 }
 
@@ -855,12 +738,6 @@ double kmeans_compute_compactness_cuda(const GpuMat& data, const GpuMat& labels,
                                        const GpuMat& centers, GpuMat& distances,
                                        int distType, int blockSize, Stream& stream)
 {
-    // Create and record start event
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, StreamAccessor::getStream(stream));
-
     const int N = data.rows;
 
     if (blockSize <= 0)
@@ -901,18 +778,6 @@ double kmeans_compute_compactness_cuda(const GpuMat& data, const GpuMat& labels,
     float compactness = 0.0f;
     cudaMemcpyAsync(&compactness, d_compactness.ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost, cudaStream);
     stream.waitForCompletion();
-
-    // Record stop event and calculate time
-    cudaEventRecord(stop, cudaStream);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    timing_stats.kmeans_compute_compactness += milliseconds;
-    timing_stats.compute_compactness_calls++;
-
-    // Cleanup
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 
     return static_cast<double>(compactness);
 }
